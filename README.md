@@ -1,5 +1,3 @@
-# modeling-metabolomics-raw-data
-
 ## Использование
 
 Создание эксперимента на основе xlsx файла:
