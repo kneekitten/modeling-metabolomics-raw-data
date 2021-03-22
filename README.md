@@ -4,7 +4,7 @@
     
     py main.py -i input_xlsx.xlsx -o out_experiment
 
-Создание одного файла на основе xlsx файла:
+Создание netCDF файла на основе xlsx файла:
 
     py main.py -i input_xlsx.xlsx -o filename.cdf
 
