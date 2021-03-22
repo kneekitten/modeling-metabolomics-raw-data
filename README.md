@@ -2,11 +2,11 @@
 
 Создание эксперимента на основе xlsx файла:
     
-    py main.py -i name.xlsx -o name_experiment
+    py main.py -i input_xlsx.xlsx -o out_experiment
 
 Создание одного файла на основе xlsx файла:
 
-    py main.py -i name.xlsx -o filename.cdf
+    py main.py -i input_xlsx.xlsx -o filename.cdf
 
 Либо просто запустить без указания имен (будет читаться стандартный xlsx файл):
 
