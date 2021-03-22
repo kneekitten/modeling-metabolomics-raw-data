@@ -2,7 +2,7 @@
 
 Создание эксперимента на основе xlsx файла:
     
-    py main.py -i input_xlsx.xlsx -o out_experiment
+    py main.py -i input_xlsx.xlsx -o name_experiment
 
 Создание netCDF файла на основе xlsx файла:
 
