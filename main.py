@@ -193,9 +193,9 @@ class Peak:
             Массовое число m/z для sn.
         name : str, default = None
             Название соединения, опционально.
-        mz_list : ndarray of np.int16
+        mz_list : np.ndarray of np.int16
             Массив массовых чисел m/z масс-спектра для пика.
-        intensity_list : ndarray of np.float16
+        intensity_list : np.ndarray of np.float16
             Массив интенсивностей масс-спектра для пика.
         dim : str, default = 'min'
             Размерность времени удерживания `rt` и параметра ширины (sigma или w6 или w05), 'sec' или 'min'.
@@ -219,7 +219,7 @@ class Peak:
             self.max = 1
         elif distribution in ('exponnormal', 'EMG'):
             assert tau > 0, f'недопустимое значение tau = {tau} для {name}'
-            self.tau = tau
+            self.tau, = min2sec(tau, dim=dim)
             self.k = self.tau / self.sigma
             if self.k <= K_EMG_TO_NORMAL:
                 self.distribution = 'normal'
@@ -253,12 +253,12 @@ class Peak:
 
         Parameters
         ----------
-        t : float, int, ndarray
+        t : float, int, np.ndarray
             Точка или вектор значений времени [сек].
 
         Returns
         -------
-        float, ndarray
+        float, np.ndarray
             Значени(е/я) функции плотности вероятности нормального распределения в `t`.
         """
 
@@ -280,12 +280,12 @@ class Peak:
 
         Parameters
         ----------
-        t : float, int, ndarray
+        t : float, int, np.ndarray
             Точка или вектор значений времени [сек].
 
         Returns
         -------
-        float, ndarray
+        float, np.ndarray
             Значени(е/я) функции плотности вероятности нормального распределения в `t`.
         """
 
@@ -311,10 +311,7 @@ class Peak:
             Найденное положение максимума.
         """
 
-        a = minimize_scalar(self.__negative_exponnorm_mu0, method='brent').x
-        if a > 0:
-            return a
-        return 0
+        return minimize_scalar(self.__negative_exponnorm_mu0, method='brent').x
 
     def _normalization_intensity_list(self, type_norm='max') -> None:
         """Нормировка интенсивностей масс спектра.
@@ -748,9 +745,8 @@ class Chromatogram:
 
         if peak.distribution in ('normal', 'G'):
 
-            min_intensity = (1 / 100) * self.sigma_noise
-            other = math.sqrt(-2 * math.log(min_intensity / (CONST_BY_SN_SIGMA_NOISE * self.sigma_noise * peak.sn))) \
-                    * peak.sigma
+            min_intensity = (1 / 100)
+            other = math.sqrt(-2 * math.log(min_intensity / peak.sn)) * peak.sigma
             return peak.rt - other, peak.rt + other
 
         elif peak.distribution in ('exponnormal', 'EMG'):
@@ -859,12 +855,12 @@ class Experiment:
             Экземпляр класса Chromatogram.
         sigma_params : dict
             Словарь, ключи которого есть имена изменяемых атрибутов пиков, а значения
-            являются массивами из величин сигма для нормального распределения.
+            являются массивами из величин сигма для нормального(rt, sigma, tau) и/или 
+            логнормального(sn) распределения.
         n_files : int
             Количество cdf файлов эксперимента.
         name : str
             Имя эксперимента.
-
         """
 
         self.peaks = deepcopy(peaks)
@@ -887,7 +883,7 @@ class Experiment:
 
         Parameters
         ----------
-        params_files : ndarray
+        params_files : np.ndarray
             Массив с новыми значениями параметров пиков
         start_idx : int
             Начальный индекс массива `params_files`. Необходим для возможности в параллельном режиме
@@ -1010,7 +1006,7 @@ class Experiment:
 
         Returns
         -------
-        ndarray
+        np.ndarray
             Массив столбцы которого соответствуют новым значениям параметров, а строки пику.
         """
 
@@ -1158,17 +1154,17 @@ def import_xlsx(filename, skip_variation=False):
 
 
 def main_experiment(xlsx: str, experiment_name: str, noise=True):
-    """Создание метаболомического эксперимента `experiment_name`.
+    """Создание файлов метаболомного эксперимента `experiment_name`.
 
     Каталог с данными эксперимента создается в той же директории, откуда запускается
     main.py и устроен сл. образом:
 
     ├── experiment_name          каталог с данными эксперимента
-    │ ├── matrix_noise              каталог с сохраненными матрицами шума в формате .npy
-    │ ├── output_cdf                каталог с cdf файлами эксперимента
-    │ ├── info_output.xlsx          xlsx таблица с новыми параметрами для каждого файла из output_cdf
-    │ ├── input_xlsx.xlsx           копия xlsx таблицы `xlsx` с исходными параметрами эксперимента
-    │ └── reference.cdf             cdf файл с параметрами из `xlsx` без вариации и без шума
+    │ ├── matrix_noise               каталог с сохраненными матрицами шума в формате .npy
+    │ ├── output_cdf                 каталог с cdf файлами эксперимента
+    │ ├── info_output.xlsx           xlsx таблица с новыми параметрами для каждого файла из output_cdf
+    │ ├── input_xlsx.xlsx            копия xlsx таблицы `xlsx` с исходными параметрами эксперимента
+    │ └── reference.cdf              cdf файл с параметрами из `xlsx` без вариации и без шума
     │
     ├── input_xlsx.xlsx          входящая xlsx таблица с параметрами эксперимента
     ├── main.py                  мы здесь (файл с исполняемым кодом)
@@ -1192,7 +1188,7 @@ def main_experiment(xlsx: str, experiment_name: str, noise=True):
     if experiment.n_files >= MORE_TO_RUN_PARALLEL and cpu_count() > 1:
         experiment.parallel_create_files(noise=noise)
     else:
-        experiment.create_files(experiment.params_files, 0)
+        experiment.create_files(experiment.params_files, 0, noise=noise)
 
     dir_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '', experiment.name))
     print(fr"-> Эксперимент {experiment.name} успешно создан и его данные находятся в {dir_path}")
