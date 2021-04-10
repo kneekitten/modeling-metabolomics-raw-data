@@ -28,8 +28,9 @@ from copy import deepcopy
 from decimal import Decimal
 from typing import List, Tuple
 import openpyxl as ox
-from multiprocessing import Process, cpu_count
+from multiprocessing import cpu_count, Process, Manager
 import os
+import sys
 import subprocess
 import argparse
 import time
@@ -40,7 +41,8 @@ CONST_BY_SN_SIGMA_NOISE = 4
 INTENSITY_BASELINE = 15.0
 CONST_BY_SQRT_NOISE = 3.8
 CONST_ADDITIVE_INTENSITY_NOISE = 30.0  # обеспечивает макс-ое кол-во положительных значений с данным алгоритмом шума
-MORE_TO_RUN_PARALLEL = 4  # кол-во файлов в Experiment больше которого включается параллельный режим
+STD_NOISE = CONST_BY_SN_SIGMA_NOISE * CONST_BY_SQRT_NOISE * math.sqrt(INTENSITY_BASELINE)
+MORE_TO_RUN_PARALLEL = 8  # кол-во файлов в Experiment больше которого включается параллельный режим
 K_EMG_TO_NORMAL = 0.001
 MAX_SN = 100000
 TYPE_INTENSITY = 'int'
@@ -121,11 +123,11 @@ def check_filename(filename: str, file_format: str) -> str:
 
     Examples
     --------
-    >>>check_filename('filename', 'cdf')
+    >>> check_filename('filename', 'cdf')
     'filename.cdf'
-    >>>check_filename('filename.cdf', 'cdf')
+    >>> check_filename('filename.cdf', 'cdf')
     'filename.cdf'
-    >>>check_filename('filename_with_:\|<*_*>|/.cdf', 'cdf')
+    >>> check_filename('filename_with_:\|<*_*>|/.cdf', 'cdf')
     Traceback (most recent call last):
         ...
     AttributeError: Имя файла не должно содержать эти символы \|/*<>?:"
@@ -210,7 +212,7 @@ class Peak:
 
         #  w -> sigma (переход от ширины к сигма параметру)
         self.sigma = sigma if sigma is not None else self.__w_to_sigma(w6=w6, w05=w05)
-        assert sigma > 0, f'недопустимое значение sigma = {self.sigma} для {name}'
+        assert self.sigma > 0, f'недопустимое значение sigma = {self.sigma} для {name}'
 
         #  min -> sec (перевод в секунды)
         self.rt, self.sigma = min2sec(rt, self.sigma, dim=dim)
@@ -246,7 +248,9 @@ class Peak:
 
         Функция плотности вероятности (без предэкспоненциального множителя):
 
-        .. math:: f(t) = \exp\left(-\frac{\left(t-\mu\right)^{2}}{2\sigma^{2}}\right)
+        .. math::
+
+            f(t) = \exp\left(-\frac{\left(t-\mu\right)^{2}}{2\sigma^{2}}\right)
 
         где :math: `\mu` положение максимума, :math: `t` время, аргумент функции,
         :math: `\sigma` - среднеквадратическое отклонение
@@ -262,7 +266,7 @@ class Peak:
             Значени(е/я) функции плотности вероятности нормального распределения в `t`.
         """
 
-        return np.exp(-(t - self.rt) ** 2 / (2 * self.sigma ** 2))
+        return np.exp(-(t - self.rt)**2 / (2 * self.sigma**2))
 
     def exponnormal(self, t):
         """Плотность вероятности экспоненциально модифицированного нормального распределения в `t`.
@@ -399,6 +403,9 @@ class Chromatogram:
     update()
         Обновить хроматограмму (перерисовать) с учетом возможных изменений параметров пиков.
 
+    update_get_peaks_areas_heights()
+        Аналог update(), но с возвращением списка площадей и высот пиков.
+
     """
 
     def __init__(self, t_start, t_end, mz_min: int, mz_max: int,
@@ -425,7 +432,8 @@ class Chromatogram:
         """
 
         assert scan_rate >= 1, f'Недопустимое значение scan_rate = {scan_rate}'
-        assert tuple(map(int, (mz_min, mz_max))) == (mz_min, mz_max), f'Минимум максимум оси mz нецелые {mz_min, mz_max}'
+        assert tuple(map(int, (mz_min, mz_max))) == (
+            mz_min, mz_max), f'Минимум максимум оси mz нецелые {mz_min, mz_max}'
         assert 0 <= mz_min <= mz_max, f'Недопустимые значения min max mz: {mz_min} {mz_max}'
         assert t_start <= t_end, f'Недопустимые значения start end t: {t_start} {t_end}'
         assert sigma_noise >= 0, f'Недопустимое значение sigma_noise = {sigma_noise}'
@@ -438,6 +446,7 @@ class Chromatogram:
         self.t_start, self.t_end = min2sec(t_start, t_end, dim=dim_t)
 
         self.scan_rate = scan_rate
+
         self.mz_min, self.mz_max = mz_min, mz_max
 
         # проверка осей
@@ -448,6 +457,7 @@ class Chromatogram:
 
         # Decimal -> float (чтобы м.б. работать с этими параметрами далее)
         self.t_start, self.t_end, self.scan_rate = map(float, (self.t_start, self.t_end, self.scan_rate))
+        self.step = 1 / self.scan_rate
 
     def set_peaks(self, peaks: List[Peak]) -> None:
         """Размещает `peaks` на хроматограмме.
@@ -663,12 +673,59 @@ class Chromatogram:
             peak.max = peak.exponnormal(peak.rt)
 
     def clear(self):
+        """Очистить хроматограмму."""
         self.data = np.zeros((self.scans_count, self.point_count), dtype=np.float64)
 
     def update(self):
+        """Обновить хроматограмму (перерисовать) с учетом возможных изменений параметров пиков."""
         self.clear()
         for peak in self.peaks:
             self._set_peak(peak)
+
+    def update_get_peaks_areas_heights(self) -> [list, list]:
+        """Обновить хроматограмму и получить площади и высоты пиков.
+
+        Отличие от метода update() в том, что этот метод помимо перерисовки хроматограммы
+        вычисляет высоту и площадь пиков и затем возвращает полученный список.
+
+        Return
+        ------
+        [peaks_areas, peaks_heights] : List[list, list]
+            Список из списка площадей и списка высот пиков.
+        """
+
+        self.clear()
+        peaks_areas = []
+        peaks_heights = []
+        for peak in self.peaks:
+            if peak.sn <= 0:
+                peaks_areas.append(0)
+                peaks_heights.append(0)
+                continue
+            # времена (начала и конца пика) -> индексы (по оси t на хроматограмме)
+            pi_start, pi_end = map(self._time2index, self._cut_peak_if_time_out(peak))
+            pt_start, pt_end = map(self._index2time, (pi_start, pi_end))
+            # вектор значений времени для пика (точки по оси t где расположен пик)
+            time_interval = np.linspace(pt_start, pt_end, pi_end - pi_start, endpoint=False)
+            mz_list, intensity_list = self._check_mz_out(peak)
+            # массовые числа -> индексы
+            mz_index_list = mz_list - self.mz_min
+
+            intensity = peak.sn * STD_NOISE  # скаляр
+            peaks_heights.append(intensity)
+
+            if peak.distribution in ('normal', 'G'):
+                intensity *= peak.normal(time_interval)  # вектор интенсивностей
+            elif peak.distribution in ('exponnormal', 'EMG'):
+                intensity *= peak.exponnormal(time_interval) / peak.max  # вектор интенсивностей
+
+            for mz, part_intensity in zip(mz_index_list, intensity_list):
+                self.data[pi_start:pi_end, mz] += intensity * part_intensity
+
+            # расчет площади базового пика методом трапеций
+            peaks_areas.append(np.trapz(y=intensity, dx=self.step))
+
+        return [peaks_areas, peaks_heights]
 
     @property
     def _get_counts_if_axes_correct(self) -> Tuple[int, int]:
@@ -750,12 +807,12 @@ class Chromatogram:
             return peak.rt - other, peak.rt + other
 
         elif peak.distribution in ('exponnormal', 'EMG'):
-            min_q = 0.00000001
+            min_q = 0.00000001  # lower tail probability
             max_q = 0.99999999
             return tuple(map(lambda x: exponnorm.ppf(x, K=peak.k, loc=peak.mu, scale=peak.sigma), (min_q, max_q)))
 
         else:
-            raise AttributeError(f"Неизвестное распределение{peak.distribution}")
+            raise AttributeError(f"Неизвестное распределение {peak.distribution}")
 
     def _cut_peak_if_time_out(self, peak: Peak) -> Tuple[float, float]:
         """Обрезает пик если он выходит за границы временной оси.
@@ -803,7 +860,7 @@ class Chromatogram:
         # массовые числа -> индексы
         mz_index_list = mz_list - self.mz_min
 
-        intensity = peak.sn * CONST_BY_SN_SIGMA_NOISE * CONST_BY_SQRT_NOISE * math.sqrt(INTENSITY_BASELINE)  # скаляр
+        intensity = peak.sn * STD_NOISE  # скаляр
 
         if peak.distribution in ('normal', 'G'):
             intensity *= peak.normal(time_interval)  # вектор интенсивностей
@@ -832,14 +889,14 @@ class Experiment:
 
     Methods
     -------
-    create_files(params_files, start_idx, noise)
+    create_files(params_files, start_idx, list_areas_heights, noise)
         Создать netCDF файлы.
 
-    parallel_create_files()
+    parallel_create_files(list_areas_heights, noise)
         Создать netCDF файлы в параллельном режиме.
 
     write_xlsx_params()
-        Записать новые параметры пиков в таблицу xlsx.
+        Записать новые параметры пиков, а также их площади и высоты в таблицу xlsx.
 
     """
 
@@ -855,30 +912,30 @@ class Experiment:
             Экземпляр класса Chromatogram.
         sigma_params : dict
             Словарь, ключи которого есть имена изменяемых атрибутов пиков, а значения
-            являются массивами из величин сигма для нормального(rt, sigma, tau) и/или 
+            являются массивами из величин сигма для нормального(rt, sigma, tau) и/или
             логнормального(sn) распределения.
         n_files : int
             Количество cdf файлов эксперимента.
         name : str
             Имя эксперимента.
         """
-
+        assert isinstance(n_files, int) and n_files > 0, f'Число файлов должно быть положительным целым числом'
         self.peaks = deepcopy(peaks)
         self.chromatogram = deepcopy(chrom)
         self.sigma_params = sigma_params
         self.missing = missing
         self.n_files = n_files
         self.name = name
-        # вычисляем новые параметры для всех файлов
-        self.params_files = self._get_params_files()
-
-        self.pointer = dict(zip(self.sigma_params.keys(), range(4)))  # 4 возможных параметров варьирования
+        self.params_files = self._get_params_files()  # вычисляем новые параметры для всех файлов
+        self.pointer = dict(zip(self.sigma_params.keys(), range(4)))  # 4 возможных параметра варьирования
         self.__create_catalog()
         self.chromatogram.set_peaks(peaks)
         self.chromatogram.create_cdf('reference.cdf', path=f'{self.name}')  # исходный образец без варьирования и шума
+        self.areas_peaks = []  # массив для хранения площадей пиков
+        self.heights_peaks = []  # массив для хранения высот пиков
 
-    def create_files(self, params_files, start_idx, noise=True):
-        """ Последовательно устанавливает новые параметры пиков из `params_files`
+    def create_files(self, params_files, start_idx: int, list_areas_heights: list, noise=True):
+        """Последовательно устанавливает новые параметры пиков из `params_files`
         на хроматограмме, а затем создает netCDF файл.
 
         Parameters
@@ -888,6 +945,8 @@ class Experiment:
         start_idx : int
             Начальный индекс массива `params_files`. Необходим для возможности в параллельном режиме
             корректно давать имена файлам в соответствии с порядком перечисления их в `params_files`.
+        list_areas_heights : list
+            Список для хранения площадей и высот пиков и номера файла [[<номер файла>, [[<площади>], [<высоты>]]],..,].
         noise : bool, default = True
             Создать файлы с шумом.
 
@@ -897,19 +956,18 @@ class Experiment:
         scan_rate = 20, mz от 50 до 500) - следует использовать этот метод, только если количество файлов <= 10.
         При большем количестве файлов (или увеличении хроматограммы и/или количества пиков) эффективнее
         использовать параллельную версию этого метода - parallel_create_files().
-
         """
 
         # вариант варьирования rt & sn & sigma & tau
         if 'rt' in self.pointer and 'sn' in self.pointer and \
                 'sigma' in self.pointer and 'tau' in self.pointer and noise:
-
             rt_idx = self.pointer['rt']
             sn_idx = self.pointer['sn']
             sigma_idx = self.pointer['sigma']
             tau_idx = self.pointer['tau']
 
-            for i, file in enumerate(params_files, start_idx):
+            for i, file in enumerate(params_files, start_idx + 1):
+                # извлекаем параметры по столбцам
                 times = file[:, rt_idx]
                 sns = file[:, sn_idx]
                 sigma = file[:, sigma_idx]
@@ -920,22 +978,54 @@ class Experiment:
                 self.chromatogram.change_rt(times)
                 self.chromatogram.change_sn(sns)
 
-                # обновляем её
-                self.chromatogram.update()
+                # переустанавливаем пики и вычисляем их площади и высоты
+                peaks_areas_heights = self.chromatogram.update_get_peaks_areas_heights()
+                list_areas_heights.append([i, peaks_areas_heights])
+
                 self.chromatogram.set_noise(f'mn_{i}.npy', self.name)  # матрица шума сохраняется
                 self.chromatogram.replace_negative(0)
                 self.chromatogram.create_cdf(f'{i}.cdf', path=f'{self.name}/output_cdf')
 
-    def parallel_create_files(self, noise=True):
+        elif 'rt' in self.pointer and 'sn' in self.pointer and \
+                'sigma' in self.pointer and 'tau' in self.pointer and not noise:
+            rt_idx = self.pointer['rt']
+            sn_idx = self.pointer['sn']
+            sigma_idx = self.pointer['sigma']
+            tau_idx = self.pointer['tau']
+
+            for i, file in enumerate(params_files, start_idx + 1):
+                # извлекаем параметры по столбцам
+                times = file[:, rt_idx]
+                sns = file[:, sn_idx]
+                sigma = file[:, sigma_idx]
+                tau = file[:, tau_idx]
+
+                # изменяем параметры пиков на хроматограмме
+                self.chromatogram.change_shape(sigma, tau)
+                self.chromatogram.change_rt(times)
+                self.chromatogram.change_sn(sns)
+
+                # переустанавливаем пики и вычисляем их площади и высоты
+                peaks_areas_heights = self.chromatogram.update_get_peaks_areas_heights()
+                list_areas_heights.append([i, peaks_areas_heights])
+
+                self.chromatogram.create_cdf(f'{i}.cdf', path=f'{self.name}/output_cdf')
+
+    def parallel_create_files(self, list_areas_heights: list, noise=True):
         """Запуск метода create_files на нескольких процессах.
 
         Массив с новыми параметрами пиков делится на n частей, где n - кол-во ядер процессора.
         Запущенные n процессов выполняют метод create_files для полученной части массива.
 
+        Parameters
+        ----------
+        list_areas_heights : list
+            Список для хранения площадей и высот пиков и номера файла [[<номер файла>, [[<площади>], [<высоты>]]],..,].
+        noise : bool, default = True
+            Установка шума.
         """
 
-        CPU = cpu_count()
-        parts = np.array_split(self.params_files, CPU)  # массив из частей
+        parts = np.array_split(self.params_files, cpu_count())  # массив из частей
 
         # ищем индексы полученных частей в исходном массиве
         acc = 0
@@ -948,7 +1038,7 @@ class Experiment:
         # создаем и запускаем процессы
         procs = []
         for idxs, part in zip(idxs_start, parts):
-            proc = Process(target=self.create_files, args=(part, idxs, noise))
+            proc = Process(target=self.create_files, args=(part, idxs, list_areas_heights, noise))
             procs.append(proc)
             proc.start()
 
@@ -968,22 +1058,22 @@ class Experiment:
 
         # добавляем имена пиков
         table += [[peak.name] for peak in self.peaks]
-        variation_params = list(self.sigma_params.keys())
+        variation_params = list(self.sigma_params.keys()) + ['Area'] + ['Height']
         prefix_filename = ''
         n_files = self.n_files
+        num_var_params = len(variation_params) - 1
 
         # имена файлов
-        for i in range(n_files):
-            table[0].extend([f'{prefix_filename}{i}.cdf'] + [None] * (len(variation_params) - 1))
+        for i in range(1, n_files + 1):
+            table[0].extend([f'{prefix_filename}{i}.cdf'] + [None] * num_var_params)
         # строка с именами параметров для файлов
         table[1].extend(variation_params * n_files)
 
         # записываем значения новых параметров пиков для файлов
-        shape = self.params_files[0].shape
-        cc_table = np.empty(shape)
-        for file in self.params_files:
-            cc_table = np.hstack((cc_table, file))
-        table_column = cc_table[:, shape[1]:].tolist()
+        cc_table = [[] for _ in range(len(self.peaks))]
+        for i, file in enumerate(self.params_files):
+            cc_table = np.concatenate((cc_table, file, self.areas_peaks[i].T, self.heights_peaks[i].T), axis=1)
+        table_column = cc_table.tolist()
 
         for p, row in enumerate(table_column):
             table[2 + p] += row
@@ -993,11 +1083,11 @@ class Experiment:
 
         # объединяем ячейки с именами файлов
         s = 2
-        e = s + len(variation_params) - 1
+        e = s + num_var_params
         for i in range(1, n_files + 1):
             ws.merge_cells(start_row=1, start_column=s, end_row=1, end_column=e)
             s = e + 1
-            e = s + len(variation_params) - 1
+            e = s + num_var_params
 
         wb.save(f'{self.name}/info_output.xlsx')
 
@@ -1096,7 +1186,7 @@ def import_xlsx(filename, skip_variation=False):
         if cell_value is not None:
             d_xl.update({cell_value: {}})
 
-    # обработка объединенных ячеек
+    # обработка объединенных ячеек (Chromatogram, Peaks, Variation)
     mcr = sheet_ranges.merged_cells.ranges
     for cr in mcr:
         name = cr.start_cell.value
@@ -1180,20 +1270,45 @@ def main_experiment(xlsx: str, experiment_name: str, noise=True):
         Включает установку шума.
     """
 
-    experiment = Experiment(*import_xlsx(xlsx), experiment_name)
-    experiment.write_xlsx_params()
-    # создаем копию xlsx таблицы с исходными параметрами эксперимента
+    print(f'-> Создание эксперимента {experiment_name}')
+    # Инициализация эксперимента, используя параметры импортируемые из xlsx файла
+    experiment = Experiment(*import_xlsx(xlsx), name=experiment_name)
+    # создаем копию xlsx таблицы с исходными параметрами в каталог эксперимента
     shutil.copy(xlsx, f'{experiment_name}/input_xlsx.xlsx')
 
+    # Создание файлов эксперимента
     if experiment.n_files >= MORE_TO_RUN_PARALLEL and cpu_count() > 1:
-        experiment.parallel_create_files(noise=noise)
+        print(f"-> Параллельное создание {experiment.n_files} файлов...")
+        _peaks_areas_heights = Manager().list()  # proxy-лист для общего использования между запущенными процессами
+        experiment.parallel_create_files(list_areas_heights=_peaks_areas_heights, noise=noise)
+        _peaks_areas_heights.sort()  # сортируем по номерам файлов
+        peaks_areas_heights = deepcopy(_peaks_areas_heights)  # proxy-list -> list, для возможности изменения списка
     else:
-        experiment.create_files(experiment.params_files, 0, noise=noise)
+        print(f"-> Последовательное создание {experiment.n_files} файлов...")
+        peaks_areas_heights = []
+        experiment.create_files(experiment.params_files, 0, list_areas_heights=peaks_areas_heights, noise=noise)
 
+    # Обработка массива с площадями и высотами пиков и запись параметров пиков всех файлов в xlsx файл
+    for file in peaks_areas_heights:
+        del file[0]  # удаляем номера файлов из списка
+        # записываем площади и высоты пиков в соответствующий аттрибут эксперимента
+        experiment.areas_peaks.append([file[0][0]])
+        experiment.heights_peaks.append([file[0][1]])
+    # превращаем полученные массивы в np.ndarray для возможности транспонирования
+    experiment.areas_peaks = np.array(experiment.areas_peaks)
+    experiment.heights_peaks = np.array(experiment.heights_peaks)
+    experiment.write_xlsx_params()  # создание info_output.xlsx
+
+    # Вывод сообщений и открытие директории с экспериментом
     dir_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '', experiment.name))
     print(fr"-> Эксперимент {experiment.name} успешно создан и его данные находятся в {dir_path}")
     if OPEN_DIR_WHEN_CREATED:
-        subprocess.Popen(rf'explorer /select, "{dir_path}\output_cdf"')
+        if sys.platform == 'win32':
+            subprocess.Popen(f'explorer {dir_path}')
+        elif sys.platform == 'linux':
+            subprocess.call(['xdg-open', dir_path])
+        else:
+            pass  # не открываем директорию с созданным экспериментом на других платформах
 
 
 def main_one_file(xlsx: str, cdf_filename: str, noise=True):
@@ -1216,6 +1331,7 @@ def main_one_file(xlsx: str, cdf_filename: str, noise=True):
         Включает установку шума.
     """
 
+    print(f'-> Создание файла {cdf_filename}')
     peaks, chromatogram = import_xlsx(xlsx, skip_variation=True)
     chromatogram.set_peaks(peaks)
     if noise:
@@ -1227,7 +1343,12 @@ def main_one_file(xlsx: str, cdf_filename: str, noise=True):
     chromatogram.create_cdf(filename=filename, path=rf'{dir_path}')
     print(f"-> Файл {cdf_filename} успешно создан и находится в {dir_path}")
     if OPEN_DIR_WHEN_CREATED:
-        subprocess.Popen(rf'explorer /select, "{dir_path}\{filename}"')
+        if sys.platform == 'win32':
+            subprocess.Popen(f'explorer {dir_path}')
+        elif sys.platform == 'linux':
+            subprocess.call(['xdg-open', dir_path])
+        else:
+            pass  # не открываем директорию с созданным файлом на других платформах
 
 
 def parse_args():
@@ -1249,6 +1370,7 @@ def parse_args():
     if args.i and not args.o.split('.')[-1] == 'cdf':
         try:
             if args.dn:
+                print(f'-> Установка шума отключена')
                 main_experiment(args.i, args.o, noise=False)
             else:
                 main_experiment(args.i, args.o, noise=True)
@@ -1259,6 +1381,7 @@ def parse_args():
     elif args.i and args.o.split('.')[-1] == 'cdf':
         try:
             if args.dn:
+                print(f'-> Установка шума отключена')
                 main_one_file(args.i, args.o, noise=False)
             else:
                 main_one_file(args.i, args.o, noise=True)
@@ -1275,11 +1398,16 @@ if __name__ == '__main__':
         pass
     # иначе попробовать сгенерировать из стандартного файла в стандартный вывод
     else:
+        print(f'-> Не были переданы параметры в командной строке')
         try:
+            print(f'-> Попытка создать эксперимент из стандартного .xlsx файла...')
             main_experiment('input_xlsx.xlsx', 'out_experiment')
-        except ValueError:
+        except TypeError:
+            print(f'-> Неудачно')
             try:
+                print(f'-> Попытка создать файл из стандартного .xlsx файла...')
                 main_one_file('input_xlsx.xlsx', 'out_file.cdf')
             except Exception as e:
+                print(f'-> Неудачно')
                 raise e
-    print(f'-> Время выполнения: {(time.time()-start):.2f} сек')
+    print(f'-> Время выполнения: {(time.time() - start):.2f} сек')
