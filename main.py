@@ -406,6 +406,9 @@ class Chromatogram:
     update_get_peaks_areas_heights()
         Аналог update(), но с возвращением списка площадей и высот пиков.
 
+    update_cdf(filename)
+        Обновить существующий netCDF файл.
+
     """
 
     def __init__(self, t_start, t_end, mz_min: int, mz_max: int,
@@ -727,6 +730,16 @@ class Chromatogram:
 
         return [peaks_areas, peaks_heights]
 
+    def update_cdf(self, filename: str, path=''):
+        """Обновляет существующий netCDF файл."""
+
+        with Dataset(f"{path}/{filename}", 'r+') as ds:
+            if TYPE_INTENSITY in ('int', 'i'):
+                self.data = np.rint(self.data)
+
+            ds.variables['total_intensity'][:] = np.sum(self.data, axis=1)
+            ds.variables['intensity_values'][:] = np.ravel(self.data)
+
     @property
     def _get_counts_if_axes_correct(self) -> Tuple[int, int]:
         """Вычисляет размерность хроматограммы.
@@ -931,6 +944,7 @@ class Experiment:
         self.__create_catalog()
         self.chromatogram.set_peaks(peaks)
         self.chromatogram.create_cdf('reference.cdf', path=f'{self.name}')  # исходный образец без варьирования и шума
+        self.__create_cdf_template()  # создаем заготовки cdf файлов с общими переменными из исходного образца
         self.areas_peaks = []  # массив для хранения площадей пиков
         self.heights_peaks = []  # массив для хранения высот пиков
 
@@ -958,7 +972,7 @@ class Experiment:
         использовать параллельную версию этого метода - parallel_create_files().
         """
 
-        # вариант варьирования rt & sn & sigma & tau
+        # вариант варьирования rt & sn & sigma & tau с шумом
         if 'rt' in self.pointer and 'sn' in self.pointer and \
                 'sigma' in self.pointer and 'tau' in self.pointer and noise:
             rt_idx = self.pointer['rt']
@@ -984,8 +998,9 @@ class Experiment:
 
                 self.chromatogram.set_noise(f'mn_{i}.npy', self.name)  # матрица шума сохраняется
                 self.chromatogram.replace_negative(0)
-                self.chromatogram.create_cdf(f'{i}.cdf', path=f'{self.name}/output_cdf')
+                self.chromatogram.update_cdf(f'{i}.cdf', path=f'{self.name}/output_cdf')
 
+        # вариант варьирования rt & sn & sigma & tau без шума
         elif 'rt' in self.pointer and 'sn' in self.pointer and \
                 'sigma' in self.pointer and 'tau' in self.pointer and not noise:
             rt_idx = self.pointer['rt']
@@ -1008,8 +1023,7 @@ class Experiment:
                 # переустанавливаем пики и вычисляем их площади и высоты
                 peaks_areas_heights = self.chromatogram.update_get_peaks_areas_heights()
                 list_areas_heights.append([i, peaks_areas_heights])
-
-                self.chromatogram.create_cdf(f'{i}.cdf', path=f'{self.name}/output_cdf')
+                self.chromatogram.update_cdf(f'{i}.cdf', path=f'{self.name}/output_cdf')
 
     def parallel_create_files(self, list_areas_heights: list, noise=True):
         """Запуск метода create_files на нескольких процессах.
@@ -1136,8 +1150,16 @@ class Experiment:
 
     def __create_catalog(self):
         # создаем каталог с экспериментом (если такой уже существует будет перезаписан!)
+        if os.path.exists(self.name):
+            shutil.rmtree(self.name)  # удаляем существующий каталог
+        # записываем новый
         os.makedirs(f"{self.name}/matrix_noise", exist_ok=True)
         os.makedirs(f"{self.name}/output_cdf", exist_ok=True)
+
+    def __create_cdf_template(self):
+
+        for i in range(1, self.n_files + 1):
+            shutil.copy(f'{self.name}/reference.cdf', f'{self.name}/output_cdf/{i}.cdf')
 
 
 def import_xlsx(filename, skip_variation=False):
